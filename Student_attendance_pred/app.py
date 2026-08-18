@@ -1,12 +1,26 @@
-from flask import Flask, render_template, request, redirect, url_for, session, send_file
-import pandas as pd
-import joblib
-from prophet import Prophet
-from werkzeug.utils import secure_filename
-import os
+from flask import (
+    Flask,
+    render_template,
+    request,
+    redirect,
+    url_for,
+    session,
+    send_file
+)
 
 import pandas as pd
 import joblib
+from prophet import Prophet
+
+from werkzeug.utils import secure_filename
+
+import os
+import traceback
+
+
+# ============================================================
+# NEW STUDENT PREDICTION FUNCTIONS
+# ============================================================
 
 from new_student_prediction import (
     create_student_model,
@@ -14,17 +28,31 @@ from new_student_prediction import (
     get_attendance_level,
     get_status
 )
+
+
+# ============================================================
+# FLASK APP
+# ============================================================
+
 app = Flask(__name__)
 
 app.secret_key = "attendance-ai-secret-key"
 
 
+# ============================================================
+# FILE PATHS
+# ============================================================
+
 PROFILE_FILE = "data/student_profiles.xlsx"
+
 MODEL_FILE = "attendance_forecasting_models.pkl"
 
 UPLOAD_FOLDER = "data/uploads"
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(
+    UPLOAD_FOLDER,
+    exist_ok=True
+)
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
@@ -34,16 +62,23 @@ app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 # ============================================================
 
 FACULTY_USERNAME = "faculty"
+
 FACULTY_PASSWORD = "faculty123"
 
 
 # ============================================================
-# LOAD DATA
+# LOAD STUDENT DATA
 # ============================================================
 
-students = pd.read_excel(PROFILE_FILE)
+students = pd.read_excel(
+    PROFILE_FILE
+)
 
-students.columns = students.columns.str.strip()
+students.columns = (
+    students.columns
+    .astype(str)
+    .str.strip()
+)
 
 students["Student_ID"] = (
     students["Student_ID"]
@@ -57,8 +92,47 @@ students["Student_ID"] = (
 # ============================================================
 
 try:
-    models = joblib.load(MODEL_FILE)
-except Exception:
+
+    models = joblib.load(
+        MODEL_FILE
+    )
+
+    if not isinstance(models, dict):
+
+        print(
+            "WARNING: Saved model file is not a dictionary.",
+            flush=True
+        )
+
+        models = {}
+
+    else:
+
+        # Normalize Student_ID keys
+        models = {
+            str(student_id).strip(): value
+            for student_id, value in models.items()
+        }
+
+        print(
+            f"Loaded {len(models)} saved student models.",
+            flush=True
+        )
+
+except Exception as e:
+
+    print(
+        "WARNING: Could not load saved models.",
+        flush=True
+    )
+
+    print(
+        repr(e),
+        flush=True
+    )
+
+    traceback.print_exc()
+
     models = {}
 
 
@@ -96,6 +170,7 @@ MONTHS = [
 
 
 MONTH_NUMBERS = {
+
     "January": 1,
     "February": 2,
     "March": 3,
@@ -117,13 +192,16 @@ MONTH_NUMBERS = {
 
 def find_student(student_id):
 
-    student_id = str(student_id).strip()
+    student_id = str(
+        student_id
+    ).strip()
 
     result = students[
         students["Student_ID"] == student_id
     ]
 
     if result.empty:
+
         return None
 
     return result.iloc[0].to_dict()
@@ -136,9 +214,11 @@ def find_student(student_id):
 def get_level(value):
 
     if value < 75:
+
         return "Low"
 
     if value <= 90:
+
         return "Medium"
 
     return "High"
@@ -150,19 +230,28 @@ def get_level(value):
 
 def get_current_attendance(student_id):
 
-    student_model = models.get(student_id)
+    student_model = models.get(
+        str(student_id).strip()
+    )
 
     if not student_model:
+
         return None
 
-    history = student_model.get("history")
+    history = student_model.get(
+        "history"
+    )
 
     if history is None or history.empty:
+
         return None
 
     value = history.iloc[-1]["y"]
 
-    return round(float(value), 2)
+    return round(
+        float(value),
+        2
+    )
 
 
 # ============================================================
@@ -171,345 +260,343 @@ def get_current_attendance(student_id):
 
 def get_student_history(student_id):
 
-    student_model = models.get(student_id)
+    student_model = models.get(
+        str(student_id).strip()
+    )
 
     if not student_model:
+
         return [], []
 
-    history = student_model.get("history")
+    history = student_model.get(
+        "history"
+    )
 
     if history is None or history.empty:
+
         return [], []
 
     history = history.copy()
 
-    history["ds"] = pd.to_datetime(history["ds"])
+    history["ds"] = pd.to_datetime(
+        history["ds"]
+    )
 
-    labels = history["ds"].dt.strftime("%B").tolist()
+    values = pd.to_numeric(
+        history["y"],
+        errors="coerce"
+    )
 
-    values = history["y"].astype(float).round(2).tolist()
+    history["y"] = values
+
+    history = history.dropna(
+        subset=["ds", "y"]
+    )
+
+    history = history.sort_values(
+        "ds"
+    )
+
+    labels = (
+        history["ds"]
+        .dt
+        .strftime("%B")
+        .tolist()
+    )
+
+    values = (
+        history["y"]
+        .astype(float)
+        .round(2)
+        .tolist()
+    )
 
     return labels, values
+
+
+# ============================================================
+# CREATE A FRESH PROPHET MODEL FROM HISTORY
+# ============================================================
+#
+# This is important for Render.
+#
+# If the saved .pkl Prophet model cannot predict because it
+# was created with a different environment/version, we rebuild
+# the Prophet model using the already available attendance
+# history.
+#
+# ============================================================
+
+def rebuild_prophet_model(history):
+
+    history = history.copy()
+
+    history["ds"] = pd.to_datetime(
+        history["ds"]
+    )
+
+    history["y"] = pd.to_numeric(
+        history["y"],
+        errors="coerce"
+    )
+
+    history = history.dropna(
+        subset=["ds", "y"]
+    )
+
+    history = history.sort_values(
+        "ds"
+    )
+
+    history = history.drop_duplicates(
+        subset=["ds"],
+        keep="last"
+    )
+
+    if len(history) < 2:
+
+        raise ValueError(
+            "At least two valid attendance months are required."
+        )
+
+    new_model = Prophet(
+
+        yearly_seasonality=False,
+
+        weekly_seasonality=False,
+
+        daily_seasonality=False
+    )
+
+    new_model.fit(
+        history[
+            ["ds", "y"]
+        ]
+    )
+
+    return new_model, history
+
+
+# ============================================================
+# SAFE PROPHET FORECAST
+# ============================================================
+
+def safe_forecast(
+    model,
+    history,
+    target_date
+):
+
+    target_date = pd.to_datetime(
+        target_date
+    )
+
+    history = history.copy()
+
+    history["ds"] = pd.to_datetime(
+        history["ds"]
+    )
+
+    history["y"] = pd.to_numeric(
+        history["y"],
+        errors="coerce"
+    )
+
+    history = history.dropna(
+        subset=["ds", "y"]
+    )
+
+    history = history.sort_values(
+        "ds"
+    )
+
+    history = history.drop_duplicates(
+        subset=["ds"],
+        keep="last"
+    )
+
+    if history.empty:
+
+        raise ValueError(
+            "Attendance history is empty."
+        )
+
+    last_date = history["ds"].max()
+
+    if target_date <= last_date:
+
+        raise ValueError(
+            "Prediction month must be after "
+            "the latest attendance month."
+        )
+
+    months_ahead = (
+
+        (
+            target_date.year
+            - last_date.year
+        ) * 12
+
+        +
+
+        (
+            target_date.month
+            - last_date.month
+        )
+    )
+
+    if months_ahead <= 0:
+
+        months_ahead = 1
+
+    # --------------------------------------------------------
+    # TRY EXISTING MODEL
+    # --------------------------------------------------------
+
+    try:
+
+        future = model.make_future_dataframe(
+
+            periods=months_ahead,
+
+            freq="MS"
+        )
+
+        forecast = model.predict(
+            future
+        )
+
+    except Exception as e:
+
+        print(
+            "Saved Prophet model failed.",
+            flush=True
+        )
+
+        print(
+            f"Reason: {repr(e)}",
+            flush=True
+        )
+
+        print(
+            "Rebuilding Prophet model from history...",
+            flush=True
+        )
+
+        traceback.print_exc()
+
+        # ----------------------------------------------------
+        # FALLBACK MODEL
+        # ----------------------------------------------------
+
+        model, history = rebuild_prophet_model(
+            history
+        )
+
+        future = model.make_future_dataframe(
+
+            periods=months_ahead,
+
+            freq="MS"
+        )
+
+        forecast = model.predict(
+            future
+        )
+
+    # --------------------------------------------------------
+    # FIND TARGET MONTH
+    # --------------------------------------------------------
+
+    forecast["ds"] = pd.to_datetime(
+        forecast["ds"]
+    )
+
+    target_rows = forecast[
+        forecast["ds"].dt.to_period("M")
+        ==
+        target_date.to_period("M")
+    ]
+
+    if target_rows.empty:
+
+        raise ValueError(
+            "Prediction could not be generated "
+            "for the selected month."
+        )
+
+    value = float(
+        target_rows.iloc[-1]["yhat"]
+    )
+
+    if pd.isna(value):
+
+        raise ValueError(
+            "Prophet returned an invalid prediction."
+        )
+
+    value = max(
+        0,
+        min(
+            100,
+            value
+        )
+    )
+
+    return round(
+        value,
+        2
+    )
 
 
 # ============================================================
 # PREDICT USING SAVED MODEL
 # ============================================================
 
-def predict_saved_model(student_id, target_month):
+def predict_saved_model(
+    student_id,
+    target_month
+):
 
-    student_model = models.get(student_id)
+    student_id = str(
+        student_id
+    ).strip()
+
+    student_model = models.get(
+        student_id
+    )
 
     if not student_model:
+
+        print(
+            f"No saved model found for {student_id}",
+            flush=True
+        )
+
         return None
 
-    model = student_model.get("model")
+    model = student_model.get(
+        "model"
+    )
 
-    history = student_model.get("history")
+    history = student_model.get(
+        "history"
+    )
 
-    if model is None or history is None:
+    if history is None or history.empty:
+
+        print(
+            f"No history found for {student_id}",
+            flush=True
+        )
+
         return None
 
     history = history.copy()
 
-    history["ds"] = pd.to_datetime(history["ds"])
-
-    last_date = history["ds"].max()
-
-    target_month_number = MONTH_NUMBERS[target_month]
-
-    target_year = last_date.year
-
-    if target_month_number <= last_date.month:
-        target_year += 1
-
-    target_date = pd.Timestamp(
-        year=target_year,
-        month=target_month_number,
-        day=1
+    history["ds"] = pd.to_datetime(
+        history["ds"]
     )
-
-    months_ahead = (
-        (target_date.year - last_date.year) * 12
-        + target_date.month
-        - last_date.month
-    )
-
-    if months_ahead <= 0:
-        months_ahead = 1
-
-    future = model.make_future_dataframe(
-        periods=months_ahead,
-        freq="MS"
-    )
-
-    forecast = model.predict(future)
-
-    result = forecast[
-        forecast["ds"] == target_date
-    ]
-
-    if result.empty:
-        return None
-
-    value = result.iloc[0]["yhat"]
-
-    value = max(
-        0,
-        min(100, float(value))
-    )
-
-    return round(value, 2)
-
-
-# ============================================================
-# CREATE MODEL FOR NEW STUDENT
-# ============================================================
-
-def predict_new_student(attendance_data, target_month):
-
-    rows = []
-
-    for month, value in attendance_data.items():
-
-        if value in [None, ""]:
-            continue
-
-        try:
-            value = float(value)
-        except:
-            continue
-
-        month_number = MONTH_NUMBERS[month]
-
-        rows.append({
-            "ds": pd.Timestamp(
-                year=2026,
-                month=month_number,
-                day=1
-            ),
-            "y": value
-        })
-
-    if len(rows) < 2:
-        return None
-
-    history = pd.DataFrame(rows)
-
-    history = history.sort_values("ds")
-
-    model = Prophet(
-        yearly_seasonality=False,
-        weekly_seasonality=False,
-        daily_seasonality=False
-    )
-
-    model.fit(history)
-
-    last_date = history["ds"].max()
-
-    target_month_number = MONTH_NUMBERS[target_month]
-
-    target_year = last_date.year
-
-    if target_month_number <= last_date.month:
-        target_year += 1
-
-    target_date = pd.Timestamp(
-        year=target_year,
-        month=target_month_number,
-        day=1
-    )
-
-    months_ahead = (
-        (target_date.year - last_date.year) * 12
-        + target_date.month
-        - last_date.month
-    )
-
-    if months_ahead <= 0:
-        months_ahead = 1
-
-    future = model.make_future_dataframe(
-        periods=months_ahead,
-        freq="MS"
-    )
-
-    forecast = model.predict(future)
-
-    result = forecast[
-        forecast["ds"] == target_date
-    ]
-
-    if result.empty:
-        return None
-
-    value = float(result.iloc[0]["yhat"])
-
-    value = max(
-        0,
-        min(100, value)
-    )
-
-    return round(value, 2)
-
-
-# ============================================================
-# HOME
-# ============================================================
-
-@app.route("/")
-def home():
-    return redirect(url_for("login"))
-
-
-# ============================================================
-# LOGIN
-# ============================================================
-@app.route("/login", methods=["GET", "POST"])
-def login():
-
-    if request.method == "GET":
-        return render_template("login.html")
-
-    login_type = request.form.get("login_type", "student")
-
-    username = request.form.get("username", "").strip()
-    password = request.form.get("password", "").strip()
-
-    # STUDENT LOGIN
-    if login_type == "student":
-
-        if not username or not password:
-            return render_template(
-                "login.html",
-                error="Please enter Student ID and Password."
-            )
-
-        if username != password:
-            return render_template(
-                "login.html",
-                error="For student login, password must be the Student ID."
-            )
-
-        student = find_student(username)
-
-        if student is None:
-            return render_template(
-                "login.html",
-                error="Student ID was not found."
-            )
-
-        session.clear()
-        session["student_id"] = username
-
-        return redirect(url_for("student_home"))
-
-    # FACULTY LOGIN
-    elif login_type == "faculty":
-
-        if (
-            username == FACULTY_USERNAME
-            and password == FACULTY_PASSWORD
-        ):
-            session.clear()
-            session["faculty"] = True
-
-            return redirect(url_for("faculty_home"))
-
-        return render_template(
-            "login.html",
-            error="Invalid faculty username or password."
-        )
-
-    return render_template(
-        "login.html",
-        error="Please select Student or Faculty login."
-    )
-# ============================================================
-# STUDENT HOME
-# ============================================================
-
-@app.route("/student-home")
-def student_home():
-
-    if "student_id" not in session:
-        return redirect(url_for("login"))
-
-    student_id = session["student_id"]
-
-    student = find_student(student_id)
-
-    if student is None:
-        session.clear()
-        return redirect(url_for("login"))
-
-    return render_template(
-        "student_home.html",
-        student=student,
-        student_id=student_id
-    )
-
-
-# ============================================================
-# STUDENT PROFILE
-# ============================================================
-
-@app.route("/profile")
-def profile():
-
-    if "student_id" not in session:
-        return redirect(url_for("login"))
-
-    student_id = session["student_id"]
-
-    student = find_student(student_id)
-
-    if student is None:
-        session.clear()
-        return redirect(url_for("login"))
-
-    return render_template(
-        "profile.html",
-        student=student,
-        student_id=student_id
-    )
-
-
-# ============================================================
-# STUDENT ATTENDANCE PREDICTION
-# ============================================================
-
-@app.route("/prediction", methods=["GET", "POST"])
-def prediction():
-
-    if "student_id" not in session:
-        return redirect(url_for("login"))
-
-    student_id = str(session["student_id"]).strip()
-
-    student = find_student(student_id)
-
-    if student is None:
-        session.clear()
-        return redirect(url_for("login"))
-
-    if student_id not in models:
-        return render_template(
-            "prediction.html",
-            student=student,
-            student_id=student_id,
-            error="Prediction model is not available for this student."
-        )
-
-    student_model = models[student_id]
-
-    model = student_model["model"]
-    history = student_model["history"]
-
-    history = history.copy()
-
-    history["ds"] = pd.to_datetime(history["ds"])
 
     history["y"] = pd.to_numeric(
         history["y"],
@@ -525,16 +612,468 @@ def prediction():
     )
 
     if history.empty:
-        return render_template(
-            "prediction.html",
-            student=student,
-            student_id=student_id,
-            error="Attendance history is not available."
+
+        return None
+
+    last_date = history["ds"].max()
+
+    if target_month not in MONTH_NUMBERS:
+
+        raise ValueError(
+            f"Invalid target month: {target_month}"
         )
 
-    # ---------------------------------------------------------
+    target_month_number = MONTH_NUMBERS[
+        target_month
+    ]
+
+    target_year = last_date.year
+
+    if target_month_number <= last_date.month:
+
+        target_year += 1
+
+    target_date = pd.Timestamp(
+
+        year=target_year,
+
+        month=target_month_number,
+
+        day=1
+    )
+
+    return safe_forecast(
+
+        model,
+
+        history,
+
+        target_date
+    )
+
+
+# ============================================================
+# CREATE MODEL FOR NEW STUDENT
+# ============================================================
+
+def predict_new_student(
+    attendance_data,
+    target_month
+):
+
+    rows = []
+
+    for month, value in attendance_data.items():
+
+        if value in [None, ""]:
+
+            continue
+
+        try:
+
+            value = float(value)
+
+        except (
+            ValueError,
+            TypeError
+        ):
+
+            continue
+
+        month_number = MONTH_NUMBERS.get(
+            month
+        )
+
+        if month_number is None:
+
+            continue
+
+        rows.append({
+
+            "ds":
+                pd.Timestamp(
+                    year=2026,
+                    month=month_number,
+                    day=1
+                ),
+
+            "y":
+                value
+        })
+
+    if len(rows) < 2:
+
+        return None
+
+    history = pd.DataFrame(
+        rows
+    )
+
+    history = history.sort_values(
+        "ds"
+    )
+
+    model = Prophet(
+
+        yearly_seasonality=False,
+
+        weekly_seasonality=False,
+
+        daily_seasonality=False
+    )
+
+    model.fit(
+        history
+    )
+
+    last_date = history["ds"].max()
+
+    target_month_number = MONTH_NUMBERS[
+        target_month
+    ]
+
+    target_year = last_date.year
+
+    if target_month_number <= last_date.month:
+
+        target_year += 1
+
+    target_date = pd.Timestamp(
+
+        year=target_year,
+
+        month=target_month_number,
+
+        day=1
+    )
+
+    return safe_forecast(
+
+        model,
+
+        history,
+
+        target_date
+    )
+
+
+# ============================================================
+# HOME
+# ============================================================
+
+@app.route("/")
+def home():
+
+    return redirect(
+        url_for("login")
+    )
+
+
+# ============================================================
+# LOGIN
+# ============================================================
+
+@app.route(
+    "/login",
+    methods=["GET", "POST"]
+)
+def login():
+
+    if request.method == "GET":
+
+        return render_template(
+            "login.html"
+        )
+
+    login_type = request.form.get(
+        "login_type",
+        "student"
+    )
+
+    username = request.form.get(
+        "username",
+        ""
+    ).strip()
+
+    password = request.form.get(
+        "password",
+        ""
+    ).strip()
+
+    # --------------------------------------------------------
+    # STUDENT LOGIN
+    # --------------------------------------------------------
+
+    if login_type == "student":
+
+        if not username or not password:
+
+            return render_template(
+                "login.html",
+                error=(
+                    "Please enter Student ID "
+                    "and Password."
+                )
+            )
+
+        if username != password:
+
+            return render_template(
+                "login.html",
+                error=(
+                    "For student login, password "
+                    "must be the Student ID."
+                )
+            )
+
+        student = find_student(
+            username
+        )
+
+        if student is None:
+
+            return render_template(
+                "login.html",
+                error="Student ID was not found."
+            )
+
+        session.clear()
+
+        session["student_id"] = username
+
+        return redirect(
+            url_for("student_home")
+        )
+
+    # --------------------------------------------------------
+    # FACULTY LOGIN
+    # --------------------------------------------------------
+
+    elif login_type == "faculty":
+
+        if (
+            username == FACULTY_USERNAME
+            and
+            password == FACULTY_PASSWORD
+        ):
+
+            session.clear()
+
+            session["faculty"] = True
+
+            return redirect(
+                url_for("faculty_home")
+            )
+
+        return render_template(
+            "login.html",
+            error=(
+                "Invalid faculty username "
+                "or password."
+            )
+        )
+
+    return render_template(
+        "login.html",
+        error=(
+            "Please select Student "
+            "or Faculty login."
+        )
+    )
+
+
+# ============================================================
+# STUDENT HOME
+# ============================================================
+
+@app.route("/student-home")
+def student_home():
+
+    if "student_id" not in session:
+
+        return redirect(
+            url_for("login")
+        )
+
+    student_id = session[
+        "student_id"
+    ]
+
+    student = find_student(
+        student_id
+    )
+
+    if student is None:
+
+        session.clear()
+
+        return redirect(
+            url_for("login")
+        )
+
+    return render_template(
+
+        "student_home.html",
+
+        student=student,
+
+        student_id=student_id
+    )
+
+
+# ============================================================
+# STUDENT PROFILE
+# ============================================================
+
+@app.route("/profile")
+def profile():
+
+    if "student_id" not in session:
+
+        return redirect(
+            url_for("login")
+        )
+
+    student_id = session[
+        "student_id"
+    ]
+
+    student = find_student(
+        student_id
+    )
+
+    if student is None:
+
+        session.clear()
+
+        return redirect(
+            url_for("login")
+        )
+
+    return render_template(
+
+        "profile.html",
+
+        student=student,
+
+        student_id=student_id
+    )
+
+
+# ============================================================
+# STUDENT ATTENDANCE PREDICTION
+# ============================================================
+
+@app.route(
+    "/prediction",
+    methods=["GET", "POST"]
+)
+def prediction():
+
+    if "student_id" not in session:
+
+        return redirect(
+            url_for("login")
+        )
+
+    student_id = str(
+        session["student_id"]
+    ).strip()
+
+    student = find_student(
+        student_id
+    )
+
+    if student is None:
+
+        session.clear()
+
+        return redirect(
+            url_for("login")
+        )
+
+    if student_id not in models:
+
+        return render_template(
+
+            "prediction.html",
+
+            student=student,
+
+            student_id=student_id,
+
+            error=(
+                "Prediction model is not "
+                "available for this student."
+            )
+        )
+
+    student_model = models[
+        student_id
+    ]
+
+    model = student_model.get(
+        "model"
+    )
+
+    history = student_model.get(
+        "history"
+    )
+
+    if history is None:
+
+        return render_template(
+
+            "prediction.html",
+
+            student=student,
+
+            student_id=student_id,
+
+            error=(
+                "Attendance history is "
+                "not available."
+            )
+        )
+
+    history = history.copy()
+
+    history["ds"] = pd.to_datetime(
+        history["ds"]
+    )
+
+    history["y"] = pd.to_numeric(
+        history["y"],
+        errors="coerce"
+    )
+
+    history = history.dropna(
+        subset=["ds", "y"]
+    )
+
+    history = history.sort_values(
+        "ds"
+    )
+
+    if history.empty:
+
+        return render_template(
+
+            "prediction.html",
+
+            student=student,
+
+            student_id=student_id,
+
+            error=(
+                "Attendance history is "
+                "not available."
+            )
+        )
+
+    # --------------------------------------------------------
     # LAST ACTUAL ATTENDANCE
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
 
     last_actual_value = float(
         history.iloc[-1]["y"]
@@ -561,9 +1100,9 @@ def prediction():
         "%B %Y"
     )
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
     # AVAILABLE FUTURE MONTHS
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
 
     start_month = (
         last_date
@@ -574,30 +1113,46 @@ def prediction():
 
     future_months = []
 
-    for i in range(1, 25):
+    for i in range(
+        1,
+        25
+    ):
 
         month_date = (
             start_month
-            + pd.DateOffset(months=i - 1)
+            + pd.DateOffset(
+                months=i - 1
+            )
         )
 
         future_months.append({
-            "value": month_date.strftime("%Y-%m"),
-            "label": month_date.strftime("%B %Y")
+
+            "value":
+                month_date.strftime(
+                    "%Y-%m"
+                ),
+
+            "label":
+                month_date.strftime(
+                    "%B %Y"
+                )
         })
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
     # DEFAULT VALUES
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
 
     predicted_value = None
+
     predicted_month = None
+
     attendance_level = None
+
     selected_month = None
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
     # PREDICT
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
 
     if request.method == "POST":
 
@@ -609,13 +1164,22 @@ def prediction():
         if not selected_month:
 
             return render_template(
+
                 "prediction.html",
+
                 student=student,
+
                 student_id=student_id,
+
                 last_actual=last_actual_value,
+
                 last_month=last_month,
+
                 future_months=future_months,
-                error="Please select a month."
+
+                error=(
+                    "Please select a month."
+                )
             )
 
         try:
@@ -627,116 +1191,119 @@ def prediction():
         except Exception:
 
             return render_template(
+
                 "prediction.html",
+
                 student=student,
+
                 student_id=student_id,
+
                 last_actual=last_actual_value,
+
                 last_month=last_month,
+
                 future_months=future_months,
-                error="Invalid prediction month."
-            )
 
-        # -----------------------------------------------------
-        # TARGET MUST BE AFTER LAST ACTUAL MONTH
-        # -----------------------------------------------------
-
-        if selected_date <= last_date.replace(day=1):
-
-            return render_template(
-                "prediction.html",
-                student=student,
-                student_id=student_id,
-                last_actual=last_actual_value,
-                last_month=last_month,
-                future_months=future_months,
-                selected_month=selected_month,
                 error=(
-                    "Please select a future month. "
-                    "You cannot predict a month already present "
-                    "in the attendance history."
+                    "Invalid prediction month."
                 )
             )
 
-        # -----------------------------------------------------
-        # NUMBER OF MONTHS TO PREDICT
-        # -----------------------------------------------------
+        # ----------------------------------------------------
+        # TARGET MUST BE FUTURE
+        # ----------------------------------------------------
 
-        months_ahead = (
-            (selected_date.year - last_date.year) * 12
-            + (selected_date.month - last_date.month)
-        )
-
-        # -----------------------------------------------------
-        # CREATE FUTURE DATA
-        # -----------------------------------------------------
-
-        future = model.make_future_dataframe(
-            periods=months_ahead,
-            freq="MS"
-        )
-
-        # -----------------------------------------------------
-        # GENERATE FORECAST
-        # -----------------------------------------------------
-
-        forecast = model.predict(
-            future
-        )
-
-        target_rows = forecast[
-            forecast["ds"].dt.to_period("M")
-            == selected_date.to_period("M")
-        ]
-
-        if target_rows.empty:
+        if selected_date <= last_date.replace(
+            day=1
+        ):
 
             return render_template(
+
                 "prediction.html",
+
                 student=student,
+
                 student_id=student_id,
+
                 last_actual=last_actual_value,
+
                 last_month=last_month,
+
                 future_months=future_months,
+
                 selected_month=selected_month,
-                error="Prediction could not be generated for the selected month."
+
+                error=(
+                    "Please select a future month. "
+                    "You cannot predict a month already "
+                    "present in the attendance history."
+                )
             )
 
-        predicted_value = float(
-            target_rows.iloc[-1]["yhat"]
-        )
+        try:
 
-        # -----------------------------------------------------
-        # KEEP ATTENDANCE BETWEEN 0 AND 100
-        # -----------------------------------------------------
+            predicted_value = safe_forecast(
 
-        predicted_value = max(
-            0,
-            min(
-                100,
+                model,
+
+                history,
+
+                selected_date
+            )
+
+            predicted_month = (
+                selected_date.strftime(
+                    "%B %Y"
+                )
+            )
+
+            attendance_level = get_level(
                 predicted_value
             )
-        )
 
-        predicted_value = round(
-            predicted_value,
-            2
-        )
+            print(
+                f"Prediction successful: "
+                f"{student_id} -> "
+                f"{predicted_month} = "
+                f"{predicted_value}",
+                flush=True
+            )
 
-        predicted_month = selected_date.strftime(
-            "%B %Y"
-        )
+        except Exception as e:
 
-        # -----------------------------------------------------
-        # ATTENDANCE LEVEL
-        # -----------------------------------------------------
+            print(
+                f"Prediction error for "
+                f"{student_id}: {repr(e)}",
+                flush=True
+            )
 
-        attendance_level = get_level(
-            predicted_value
-        )
+            traceback.print_exc()
 
-    # ---------------------------------------------------------
-    # SEND DATA TO TEMPLATE
-    # ---------------------------------------------------------
+            return render_template(
+
+                "prediction.html",
+
+                student=student,
+
+                student_id=student_id,
+
+                last_actual=last_actual_value,
+
+                last_month=last_month,
+
+                future_months=future_months,
+
+                selected_month=selected_month,
+
+                error=(
+                    "Prediction failed: "
+                    + str(e)
+                )
+            )
+
+    # --------------------------------------------------------
+    # SEND TO TEMPLATE
+    # --------------------------------------------------------
 
     return render_template(
 
@@ -760,7 +1327,9 @@ def prediction():
 
         attendance_level=attendance_level
     )
- # ============================================================
+
+
+# ============================================================
 # STUDENT DASHBOARD
 # ============================================================
 
@@ -768,7 +1337,10 @@ def prediction():
 def student_dashboard():
 
     if "student_id" not in session:
-        return redirect(url_for("login"))
+
+        return redirect(
+            url_for("login")
+        )
 
     student_id = str(
         session["student_id"]
@@ -779,14 +1351,19 @@ def student_dashboard():
     )
 
     if student is None:
+
         session.clear()
-        return redirect(url_for("login"))
+
+        return redirect(
+            url_for("login")
+        )
 
     # --------------------------------------------------------
-    # ATTENDANCE HISTORY FOR CHART
+    # ATTENDANCE HISTORY
     # --------------------------------------------------------
 
     chart_labels = []
+
     chart_values = []
 
     if student_id in models:
@@ -855,6 +1432,7 @@ def student_dashboard():
     # --------------------------------------------------------
 
     predicted_value = None
+
     predicted_month = None
 
     if student_id in models:
@@ -872,74 +1450,51 @@ def student_dashboard():
         )
 
         if (
-            model is not None
-            and history is not None
+            history is not None
             and not history.empty
         ):
 
-            history = history.copy()
+            try:
 
-            history["ds"] = pd.to_datetime(
-                history["ds"]
-            )
+                history = history.copy()
 
-            history["y"] = pd.to_numeric(
-                history["y"],
-                errors="coerce"
-            )
-
-            history = history.dropna(
-                subset=["ds", "y"]
-            )
-
-            history = history.sort_values(
-                "ds"
-            )
-
-            if not history.empty:
-
-                last_date = pd.to_datetime(
-                    history.iloc[-1]["ds"]
+                history["ds"] = pd.to_datetime(
+                    history["ds"]
                 )
 
-                next_month = (
-                    last_date
-                    + pd.offsets.MonthBegin(1)
+                history["y"] = pd.to_numeric(
+                    history["y"],
+                    errors="coerce"
                 )
 
-                future = (
-                    model.make_future_dataframe(
-                        periods=1,
-                        freq="MS"
-                    )
+                history = history.dropna(
+                    subset=["ds", "y"]
                 )
 
-                forecast = model.predict(
-                    future
+                history = history.sort_values(
+                    "ds"
                 )
 
-                target_rows = forecast[
-                    forecast["ds"]
-                    == next_month
-                ]
+                if not history.empty:
 
-                if not target_rows.empty:
-
-                    predicted_value = float(
-                        target_rows.iloc[-1]["yhat"]
+                    last_date = pd.to_datetime(
+                        history.iloc[-1]["ds"]
                     )
 
-                    predicted_value = max(
-                        0,
-                        min(
-                            100,
-                            predicted_value
-                        )
+                    next_month = (
+                        last_date
+                        + pd.offsets.MonthBegin(1)
+                    ).replace(
+                        day=1
                     )
 
-                    predicted_value = round(
-                        predicted_value,
-                        2
+                    predicted_value = safe_forecast(
+
+                        model,
+
+                        history,
+
+                        next_month
                     )
 
                     predicted_month = (
@@ -948,11 +1503,23 @@ def student_dashboard():
                         )
                     )
 
+            except Exception as e:
+
+                print(
+                    f"Student dashboard prediction "
+                    f"error for {student_id}: "
+                    f"{repr(e)}",
+                    flush=True
+                )
+
+                traceback.print_exc()
+
     # --------------------------------------------------------
-    # SEND DATA TO TEMPLATE
+    # SEND DATA
     # --------------------------------------------------------
 
     return render_template(
+
         "student_dashboard.html",
 
         student=student,
@@ -968,7 +1535,9 @@ def student_dashboard():
         chart_labels=chart_labels,
 
         chart_values=chart_values
-    )   
+    )
+
+
 # ============================================================
 # FACULTY HOME
 # ============================================================
@@ -977,7 +1546,10 @@ def student_dashboard():
 def faculty_home():
 
     if "faculty" not in session:
-        return redirect(url_for("login"))
+
+        return redirect(
+            url_for("login")
+        )
 
     return render_template(
         "faculty_home.html"
@@ -992,9 +1564,13 @@ def faculty_home():
 def faculty_attendance():
 
     if "faculty" not in session:
-        return redirect(url_for("login"))
+
+        return redirect(
+            url_for("login")
+        )
 
     departments = sorted(
+
         students["Department"]
         .dropna()
         .astype(str)
@@ -1003,7 +1579,9 @@ def faculty_attendance():
     )
 
     return render_template(
+
         "faculty_attendance.html",
+
         departments=departments
     )
 
@@ -1016,7 +1594,10 @@ def faculty_attendance():
 def department_attendance():
 
     if "faculty" not in session:
-        return redirect(url_for("login"))
+
+        return redirect(
+            url_for("login")
+        )
 
     department = request.args.get(
         "department",
@@ -1024,16 +1605,20 @@ def department_attendance():
     ).strip()
 
     if not department:
+
         return redirect(
             url_for("faculty_attendance")
         )
 
     department_students = students[
+
         students["Department"]
         .astype(str)
         .str.strip()
         .str.lower()
-        == department.lower()
+        ==
+        department.lower()
+
     ].copy()
 
     result = []
@@ -1045,33 +1630,76 @@ def department_attendance():
         ).strip()
 
         student_data = {
-            "Student_ID": student_id,
-            "Roll_No": student.get("Roll_No", ""),
-            "Name": student.get("Name", ""),
-            "Email": student.get("Email", ""),
-            "Gender": student.get("Gender", ""),
-            "Year": student.get("Year", ""),
-            "Attendance": None,
-            "Predicted_Attendance": None,
-            "Predicted_Month": None,
-            "Attendance_Level": "-",
-            "Status": "-"
+
+            "Student_ID":
+                student_id,
+
+            "Roll_No":
+                student.get(
+                    "Roll_No",
+                    ""
+                ),
+
+            "Name":
+                student.get(
+                    "Name",
+                    ""
+                ),
+
+            "Email":
+                student.get(
+                    "Email",
+                    ""
+                ),
+
+            "Gender":
+                student.get(
+                    "Gender",
+                    ""
+                ),
+
+            "Year":
+                student.get(
+                    "Year",
+                    ""
+                ),
+
+            "Attendance":
+                None,
+
+            "Predicted_Attendance":
+                None,
+
+            "Predicted_Month":
+                None,
+
+            "Attendance_Level":
+                "-",
+
+            "Status":
+                "-"
         }
 
-        # ====================================================
-        # GET SAVED MODEL
-        # ====================================================
-
-        student_model = models.get(student_id)
+        student_model = models.get(
+            student_id
+        )
 
         if student_model:
 
             try:
 
-                model = student_model.get("model")
-                history = student_model.get("history")
+                model = student_model.get(
+                    "model"
+                )
 
-                if model is not None and history is not None:
+                history = student_model.get(
+                    "history"
+                )
+
+                if (
+                    history is not None
+                    and not history.empty
+                ):
 
                     history = history.copy()
 
@@ -1094,10 +1722,6 @@ def department_attendance():
 
                     if not history.empty:
 
-                        # ====================================================
-                        # CURRENT ATTENDANCE
-                        # ====================================================
-
                         current_attendance = float(
                             history.iloc[-1]["y"]
                         )
@@ -1110,22 +1734,16 @@ def department_attendance():
                             )
                         )
 
-                        student_data["Attendance"] = round(
+                        student_data[
+                            "Attendance"
+                        ] = round(
                             current_attendance,
                             2
                         )
 
-                        # ====================================================
-                        # LAST ACTUAL MONTH
-                        # ====================================================
-
                         last_date = pd.to_datetime(
                             history.iloc[-1]["ds"]
                         )
-
-                        # ====================================================
-                        # NEXT MONTH
-                        # ====================================================
 
                         next_month = (
                             last_date
@@ -1134,106 +1752,61 @@ def department_attendance():
                             day=1
                         )
 
-                        # ====================================================
-                        # PREDICTION
-                        # ====================================================
+                        prediction_value = safe_forecast(
 
-                        future = model.make_future_dataframe(
-                            periods=1,
-                            freq="MS"
+                            model,
+
+                            history,
+
+                            next_month
                         )
 
-                        forecast = model.predict(
-                            future
+                        student_data[
+                            "Predicted_Attendance"
+                        ] = prediction_value
+
+                        student_data[
+                            "Predicted_Month"
+                        ] = next_month.strftime(
+                            "%B %Y"
                         )
 
-                        target_rows = forecast[
-                            forecast["ds"].dt.to_period("M")
-                            == next_month.to_period("M")
-                        ]
+                        student_data[
+                            "Attendance_Level"
+                        ] = get_level(
+                            prediction_value
+                        )
 
-                        if not target_rows.empty:
-
-                            prediction_value = float(
-                                target_rows.iloc[-1]["yhat"]
-                            )
-
-                            prediction_value = max(
-                                0,
-                                min(
-                                    100,
-                                    prediction_value
-                                )
-                            )
-
-                            prediction_value = round(
-                                prediction_value,
-                                2
-                            )
-
-                            student_data[
-                                "Predicted_Attendance"
-                            ] = prediction_value
-
-                            # ====================================================
-                            # PREDICTED MONTH
-                            # ====================================================
-
-                            student_data[
-                                "Predicted_Month"
-                            ] = next_month.strftime(
-                                "%B %Y"
-                            )
-
-                            # ====================================================
-                            # ATTENDANCE LEVEL
-                            # ====================================================
-
-                            student_data[
-                                "Attendance_Level"
-                            ] = get_level(
-                                prediction_value
-                            )
-
-                            # ====================================================
-                            # STATUS
-                            # ====================================================
-
-                            if prediction_value >= 75:
-
-                                student_data[
-                                    "Status"
-                                ] = "Safe"
-
-                            elif prediction_value >= 65:
-
-                                student_data[
-                                    "Status"
-                                ] = "At Risk"
-
-                            else:
-
-                                student_data[
-                                    "Status"
-                                ] = "High Risk"
+                        student_data[
+                            "Status"
+                        ] = get_status(
+                            prediction_value
+                        )
 
             except Exception as e:
 
                 print(
-                    f"Prediction error for {student_id}: {e}"
+                    f"Prediction error for "
+                    f"{student_id}: {repr(e)}",
+                    flush=True
                 )
+
+                traceback.print_exc()
 
         result.append(
             student_data
         )
 
-    # ========================================================
-    # DEPARTMENT CURRENT AVERAGE
-    # ========================================================
+    # --------------------------------------------------------
+    # CURRENT AVERAGE
+    # --------------------------------------------------------
 
     valid_current = [
+
         student["Attendance"]
+
         for student in result
+
         if student["Attendance"] is not None
     ]
 
@@ -1242,18 +1815,24 @@ def department_attendance():
     if valid_current:
 
         department_current_average = round(
+
             sum(valid_current)
-            / len(valid_current),
+            /
+            len(valid_current),
+
             2
         )
 
-    # ========================================================
-    # DEPARTMENT PREDICTED AVERAGE
-    # ========================================================
+    # --------------------------------------------------------
+    # PREDICTED AVERAGE
+    # --------------------------------------------------------
 
     valid_predictions = [
+
         student["Predicted_Attendance"]
+
         for student in result
+
         if student["Predicted_Attendance"] is not None
     ]
 
@@ -1262,14 +1841,17 @@ def department_attendance():
     if valid_predictions:
 
         department_predicted_average = round(
+
             sum(valid_predictions)
-            / len(valid_predictions),
+            /
+            len(valid_predictions),
+
             2
         )
 
-    # ========================================================
+    # --------------------------------------------------------
     # PREDICTED MONTH
-    # ========================================================
+    # --------------------------------------------------------
 
     predicted_month = None
 
@@ -1282,10 +1864,6 @@ def department_attendance():
             ]
 
             break
-
-    # ========================================================
-    # SHOW DEPARTMENT ATTENDANCE
-    # ========================================================
 
     return render_template(
 
@@ -1307,6 +1885,7 @@ def department_attendance():
             predicted_month
     )
 
+
 # ============================================================
 # FACULTY OVERALL PREDICTION
 # ============================================================
@@ -1318,9 +1897,13 @@ def department_attendance():
 def faculty_overall_prediction():
 
     if "faculty" not in session:
-        return redirect(url_for("login"))
+
+        return redirect(
+            url_for("login")
+        )
 
     departments = sorted(
+
         students["Department"]
         .dropna()
         .astype(str)
@@ -1329,6 +1912,7 @@ def faculty_overall_prediction():
     )
 
     years = sorted(
+
         students["Year"]
         .dropna()
         .astype(str)
@@ -1337,6 +1921,7 @@ def faculty_overall_prediction():
     )
 
     genders = sorted(
+
         students["Gender"]
         .dropna()
         .astype(str)
@@ -1367,21 +1952,36 @@ def faculty_overall_prediction():
         filtered = students.copy()
 
         if department:
+
             filtered = filtered[
-                filtered["Department"].astype(str)
-                == department
+
+                filtered["Department"]
+                .astype(str)
+                ==
+                department
+
             ]
 
         if year:
+
             filtered = filtered[
-                filtered["Year"].astype(str)
-                == year
+
+                filtered["Year"]
+                .astype(str)
+                ==
+                year
+
             ]
 
         if gender:
+
             filtered = filtered[
-                filtered["Gender"].astype(str)
-                == gender
+
+                filtered["Gender"]
+                .astype(str)
+                ==
+                gender
+
             ]
 
         predictions = []
@@ -1392,38 +1992,65 @@ def faculty_overall_prediction():
                 student["Student_ID"]
             ).strip()
 
-            prediction_value = predict_saved_model(
-                student_id,
-                target_month
-            )
+            try:
 
-            if prediction_value is not None:
-
-                predictions.append(
-                    prediction_value
+                prediction_value = (
+                    predict_saved_model(
+                        student_id,
+                        target_month
+                    )
                 )
+
+                if prediction_value is not None:
+
+                    predictions.append(
+                        prediction_value
+                    )
+
+            except Exception as e:
+
+                print(
+                    f"Overall prediction error "
+                    f"for {student_id}: "
+                    f"{repr(e)}",
+                    flush=True
+                )
+
+                traceback.print_exc()
 
         if predictions:
 
             result = {
-                "count": len(predictions),
-                "average": round(
-                    sum(predictions)
-                    / len(predictions),
-                    2
-                ),
-                "highest": round(
-                    max(predictions),
-                    2
-                ),
-                "lowest": round(
-                    min(predictions),
-                    2
-                ),
-                "month": target_month
+
+                "count":
+                    len(predictions),
+
+                "average":
+                    round(
+                        sum(predictions)
+                        /
+                        len(predictions),
+                        2
+                    ),
+
+                "highest":
+                    round(
+                        max(predictions),
+                        2
+                    ),
+
+                "lowest":
+                    round(
+                        min(predictions),
+                        2
+                    ),
+
+                "month":
+                    target_month
             }
 
     return render_template(
+
         "faculty_overall_prediction.html",
 
         departments=departments,
@@ -1438,13 +2065,24 @@ def faculty_overall_prediction():
     )
 
 
-@app.route("/faculty-dashboard", methods=["GET", "POST"])
+# ============================================================
+# FACULTY DASHBOARD
+# ============================================================
+
+@app.route(
+    "/faculty-dashboard",
+    methods=["GET", "POST"]
+)
 def faculty_dashboard():
 
     if "faculty" not in session:
-        return redirect(url_for("login"))
+
+        return redirect(
+            url_for("login")
+        )
 
     departments = sorted(
+
         students["Department"]
         .dropna()
         .astype(str)
@@ -1461,30 +2099,43 @@ def faculty_dashboard():
     result = []
 
     total_students = 0
+
     current_average = None
+
     predicted_average = None
+
     highest_attendance = None
+
     lowest_attendance = None
 
     safe_count = 0
+
     at_risk_count = 0
+
     high_risk_count = 0
 
     high_count = 0
+
     medium_count = 0
+
     low_count = 0
 
     if selected_department:
 
         department_students = students[
+
             students["Department"]
             .astype(str)
             .str.strip()
             .str.lower()
-            == selected_department.lower()
+            ==
+            selected_department.lower()
+
         ].copy()
 
-        total_students = len(department_students)
+        total_students = len(
+            department_students
+        )
 
         for _, student in department_students.iterrows():
 
@@ -1494,43 +2145,53 @@ def faculty_dashboard():
 
             student_data = {
 
-                "Student_ID": student_id,
+                "Student_ID":
+                    student_id,
 
-                "Roll_No": student.get(
-                    "Roll_No",
-                    ""
-                ),
+                "Roll_No":
+                    student.get(
+                        "Roll_No",
+                        ""
+                    ),
 
-                "Name": student.get(
-                    "Name",
-                    ""
-                ),
+                "Name":
+                    student.get(
+                        "Name",
+                        ""
+                    ),
 
-                "Email": student.get(
-                    "Email",
-                    ""
-                ),
+                "Email":
+                    student.get(
+                        "Email",
+                        ""
+                    ),
 
-                "Gender": student.get(
-                    "Gender",
-                    ""
-                ),
+                "Gender":
+                    student.get(
+                        "Gender",
+                        ""
+                    ),
 
-                "Year": student.get(
-                    "Year",
-                    ""
-                ),
+                "Year":
+                    student.get(
+                        "Year",
+                        ""
+                    ),
 
-                "Attendance": None,
+                "Attendance":
+                    None,
 
-                "Predicted_Attendance": None,
+                "Predicted_Attendance":
+                    None,
 
-                "Predicted_Month": None,
+                "Predicted_Month":
+                    None,
 
-                "Attendance_Level": "-",
+                "Attendance_Level":
+                    "-",
 
-                "Status": "-"
-
+                "Status":
+                    "-"
             }
 
             student_model = models.get(
@@ -1550,8 +2211,7 @@ def faculty_dashboard():
                     )
 
                     if (
-                        model is not None
-                        and history is not None
+                        history is not None
                         and not history.empty
                     ):
 
@@ -1579,8 +2239,6 @@ def faculty_dashboard():
 
                         if not history.empty:
 
-                            # CURRENT ATTENDANCE
-
                             current = float(
                                 history.iloc[-1]["y"]
                             )
@@ -1602,8 +2260,6 @@ def faculty_dashboard():
                                 "Attendance"
                             ] = current
 
-                            # NEXT MONTH
-
                             last_date = pd.to_datetime(
                                 history.iloc[-1]["ds"]
                             )
@@ -1615,111 +2271,87 @@ def faculty_dashboard():
                                 day=1
                             )
 
-                            future = (
-                                model.make_future_dataframe(
-                                    periods=1,
-                                    freq="MS"
-                                )
+                            prediction = safe_forecast(
+
+                                model,
+
+                                history,
+
+                                next_month
                             )
 
-                            forecast = model.predict(
-                                future
+                            student_data[
+                                "Predicted_Attendance"
+                            ] = prediction
+
+                            student_data[
+                                "Predicted_Month"
+                            ] = next_month.strftime(
+                                "%B %Y"
                             )
 
-                            target_rows = forecast[
-                                forecast["ds"].dt.to_period("M")
-                                == next_month.to_period("M")
-                            ]
+                            if prediction > 90:
 
-                            if not target_rows.empty:
+                                level = "High"
 
-                                prediction = float(
-                                    target_rows.iloc[-1]["yhat"]
-                                )
+                                high_count += 1
 
-                                prediction = max(
-                                    0,
-                                    min(
-                                        100,
-                                        prediction
-                                    )
-                                )
+                            elif prediction >= 75:
 
-                                prediction = round(
-                                    prediction,
-                                    2
-                                )
+                                level = "Medium"
 
-                                student_data[
-                                    "Predicted_Attendance"
-                                ] = prediction
+                                medium_count += 1
 
-                                student_data[
-                                    "Predicted_Month"
-                                ] = next_month.strftime(
-                                    "%B %Y"
-                                )
+                            else:
 
-                                # ATTENDANCE LEVEL
+                                level = "Low"
 
-                                if prediction > 90:
+                                low_count += 1
 
-                                    level = "High"
+                            student_data[
+                                "Attendance_Level"
+                            ] = level
 
-                                    high_count += 1
+                            if prediction >= 75:
 
-                                elif prediction >= 75:
+                                status = "Safe"
 
-                                    level = "Medium"
+                                safe_count += 1
 
-                                    medium_count += 1
+                            elif prediction >= 65:
 
-                                else:
+                                status = "At Risk"
 
-                                    level = "Low"
+                                at_risk_count += 1
 
-                                    low_count += 1
+                            else:
 
-                                student_data[
-                                    "Attendance_Level"
-                                ] = level
+                                status = "High Risk"
 
-                                # STATUS
+                                high_risk_count += 1
 
-                                if prediction >= 75:
-
-                                    status = "Safe"
-
-                                    safe_count += 1
-
-                                elif prediction >= 65:
-
-                                    status = "At Risk"
-
-                                    at_risk_count += 1
-
-                                else:
-
-                                    status = "High Risk"
-
-                                    high_risk_count += 1
-
-                                student_data[
-                                    "Status"
-                                ] = status
+                            student_data[
+                                "Status"
+                            ] = status
 
                 except Exception as e:
 
                     print(
                         f"Dashboard prediction error "
-                        f"for {student_id}: {e}"
+                        f"for {student_id}: "
+                        f"{repr(e)}",
+                        flush=True
                     )
+
+                    traceback.print_exc()
 
             result.append(
                 student_data
             )
 
+        # ----------------------------------------------------
         # CURRENT ATTENDANCE
+        # ----------------------------------------------------
 
         current_values = [
 
@@ -1728,28 +2360,36 @@ def faculty_dashboard():
             for s in result
 
             if s["Attendance"] is not None
-
         ]
 
         if current_values:
 
             current_average = round(
+
                 sum(current_values)
-                / len(current_values),
+                /
+                len(current_values),
+
                 2
             )
 
             highest_attendance = round(
+
                 max(current_values),
+
                 2
             )
 
             lowest_attendance = round(
+
                 min(current_values),
+
                 2
             )
 
+        # ----------------------------------------------------
         # PREDICTED ATTENDANCE
+        # ----------------------------------------------------
 
         prediction_values = [
 
@@ -1758,14 +2398,16 @@ def faculty_dashboard():
             for s in result
 
             if s["Predicted_Attendance"] is not None
-
         ]
 
         if prediction_values:
 
             predicted_average = round(
+
                 sum(prediction_values)
-                / len(prediction_values),
+                /
+                len(prediction_values),
+
                 2
             )
 
@@ -1775,33 +2417,45 @@ def faculty_dashboard():
 
         departments=departments,
 
-        selected_department=selected_department,
+        selected_department=
+            selected_department,
 
         students=result,
 
-        total_students=total_students,
+        total_students=
+            total_students,
 
-        current_average=current_average,
+        current_average=
+            current_average,
 
-        predicted_average=predicted_average,
+        predicted_average=
+            predicted_average,
 
-        highest_attendance=highest_attendance,
+        highest_attendance=
+            highest_attendance,
 
-        lowest_attendance=lowest_attendance,
+        lowest_attendance=
+            lowest_attendance,
 
-        safe_count=safe_count,
+        safe_count=
+            safe_count,
 
-        at_risk_count=at_risk_count,
+        at_risk_count=
+            at_risk_count,
 
-        high_risk_count=high_risk_count,
+        high_risk_count=
+            high_risk_count,
 
-        high_count=high_count,
+        high_count=
+            high_count,
 
-        medium_count=medium_count,
+        medium_count=
+            medium_count,
 
-        low_count=low_count
-
+        low_count=
+            low_count
     )
+
 
 # ============================================================
 # UPLOAD DATA
@@ -1814,39 +2468,58 @@ def faculty_dashboard():
 def upload_data():
 
     if "faculty" not in session:
-        return redirect(url_for("login"))
+
+        return redirect(
+            url_for("login")
+        )
 
     result = None
+
     error = None
+
     selected_months = []
+
     prediction_count = 1
 
     if request.method == "POST":
 
-        file = request.files.get("file")
+        file = request.files.get(
+            "file"
+        )
 
         try:
+
             prediction_count = int(
                 request.form.get(
                     "prediction_count",
                     "1"
                 )
             )
-        except:
+
+        except Exception:
+
             prediction_count = 1
 
         if prediction_count not in [1, 2, 3]:
+
             prediction_count = 1
 
         if file is None or file.filename == "":
 
-            error = "Please select an Excel file."
+            error = (
+                "Please select an Excel file."
+            )
 
         elif not file.filename.lower().endswith(
-            (".xlsx", ".xls")
+            (
+                ".xlsx",
+                ".xls"
+            )
         ):
 
-            error = "Please upload an Excel file."
+            error = (
+                "Please upload an Excel file."
+            )
 
         else:
 
@@ -1855,49 +2528,67 @@ def upload_data():
             )
 
             filepath = os.path.join(
-                app.config["UPLOAD_FOLDER"],
+
+                app.config[
+                    "UPLOAD_FOLDER"
+                ],
+
                 filename
             )
 
-            file.save(filepath)
+            file.save(
+                filepath
+            )
 
             try:
 
-                # ========================================================
+                # ------------------------------------------------
                 # READ EXCEL
-                # ========================================================
+                # ------------------------------------------------
 
                 uploaded = pd.read_excel(
                     filepath
                 )
 
                 uploaded.columns = (
+
                     uploaded.columns
                     .astype(str)
                     .str.strip()
                 )
 
-                print("\n===================================")
-                print("UPLOADED EXCEL COLUMNS")
-                print("===================================")
+                print(
+                    "\n===================================",
+                    flush=True
+                )
 
                 print(
-                    uploaded.columns.tolist()
+                    "UPLOADED EXCEL COLUMNS",
+                    flush=True
+                )
+
+                print(
+                    uploaded.columns.tolist(),
+                    flush=True
                 )
 
                 print(
                     "Rows:",
-                    len(uploaded)
+                    len(uploaded),
+                    flush=True
                 )
 
-                print("===================================\n")
+                print(
+                    "===================================\n",
+                    flush=True
+                )
 
-
-                # ========================================================
-                # REQUIRED STUDENT COLUMNS
-                # ========================================================
+                # ------------------------------------------------
+                # REQUIRED COLUMNS
+                # ------------------------------------------------
 
                 required_columns = [
+
                     "Student_ID",
                     "Roll_No",
                     "Name",
@@ -1909,24 +2600,29 @@ def upload_data():
                 ]
 
                 missing = [
+
                     column
+
                     for column in required_columns
+
                     if column not in uploaded.columns
                 ]
-
 
                 if missing:
 
                     error = (
+
                         "Missing columns: "
-                        + ", ".join(missing)
+
+                        +
+                        ", ".join(missing)
                     )
 
                 else:
 
-                    # ====================================================
+                    # ------------------------------------------------
                     # MONTH ALIASES
-                    # ====================================================
+                    # ------------------------------------------------
 
                     month_aliases = {
 
@@ -1967,10 +2663,9 @@ def upload_data():
                         "dec": 12
                     }
 
-
-                    # ====================================================
+                    # ------------------------------------------------
                     # FIND MONTH COLUMNS
-                    # ====================================================
+                    # ------------------------------------------------
 
                     month_data = {}
 
@@ -1981,19 +2676,25 @@ def upload_data():
                         ).strip()
 
                         normalized_column = (
+
                             original_column
                             .lower()
-                            .replace("-", "_")
-                            .replace(" ", "_")
+                            .replace(
+                                "-",
+                                "_"
+                            )
+                            .replace(
+                                " ",
+                                "_"
+                            )
                         )
 
                         found_month = None
 
-                        # ------------------------------------------------
-                        # EXACT MONTH
-                        # ------------------------------------------------
-
-                        if normalized_column in month_aliases:
+                        if (
+                            normalized_column
+                            in month_aliases
+                        ):
 
                             found_month = (
                                 month_aliases[
@@ -2001,26 +2702,21 @@ def upload_data():
                                 ]
                             )
 
-                        # ------------------------------------------------
-                        # COLUMN ENDING WITH MONTH
-                        #
-                        # Examples:
-                        # NLP_Jan
-                        # AI_Mar
-                        # Attendance_Nov
-                        # ------------------------------------------------
-
                         if found_month is None:
 
-                            for alias, month_number in (
-                                month_aliases.items()
-                            ):
+                            for (
+                                alias,
+                                month_number
+                            ) in month_aliases.items():
 
                                 if (
+
                                     normalized_column.endswith(
                                         "_" + alias
                                     )
+
                                     or
+
                                     normalized_column.endswith(
                                         alias
                                     )
@@ -2032,17 +2728,15 @@ def upload_data():
 
                                     break
 
-
                         if found_month is not None:
 
                             month_data[
                                 found_month
                             ] = original_column
 
-
-                    # ====================================================
-                    # ALSO CHECK DATE-TYPE COLUMN HEADERS
-                    # ====================================================
+                    # ------------------------------------------------
+                    # DATE-TYPE HEADERS
+                    # ------------------------------------------------
 
                     if len(month_data) < 2:
 
@@ -2051,7 +2745,9 @@ def upload_data():
                             try:
 
                                 parsed = pd.to_datetime(
+
                                     str(column),
+
                                     errors="coerce"
                                 )
 
@@ -2069,56 +2765,62 @@ def upload_data():
 
                                         month_data[
                                             month_number
-                                        ] = str(column)
+                                        ] = str(
+                                            column
+                                        )
 
-                            except:
+                            except Exception:
 
                                 pass
 
-
-                    # ====================================================
+                    # ------------------------------------------------
                     # SORT MONTHS
-                    # ====================================================
+                    # ------------------------------------------------
 
                     month_numbers = sorted(
                         month_data.keys()
                     )
 
-
                     print(
-                        "Detected attendance months:"
+                        "Detected attendance months:",
+                        flush=True
                     )
 
                     for month_number in month_numbers:
 
                         print(
+
                             month_number,
+
                             "->",
+
                             month_data[
                                 month_number
-                            ]
+                            ],
+
+                            flush=True
                         )
 
-
-                    # ====================================================
+                    # ------------------------------------------------
                     # CHECK MONTH COUNT
-                    # ====================================================
+                    # ------------------------------------------------
 
                     if len(month_numbers) < 2:
 
                         error = (
-                            "Attendance columns were not detected. "
-                            "Please make sure your Excel contains "
-                            "at least two month columns such as "
-                            "Jan, Feb, Mar... or "
-                            "January, February, March..."
+
+                            "Attendance columns were "
+                            "not detected. Please make "
+                            "sure your Excel contains at "
+                            "least two month columns such "
+                            "as Jan, Feb, Mar..."
                         )
 
                     else:
 
-                        # =================================================
-                        # LAST AVAILABLE MONTH
-                        # =================================================
+                        # --------------------------------------------
+                        # LAST MONTH
+                        # --------------------------------------------
 
                         last_month_number = (
                             month_numbers[-1]
@@ -2127,26 +2829,33 @@ def upload_data():
                         last_year = 2026
 
                         last_date = pd.Timestamp(
+
                             year=last_year,
+
                             month=last_month_number,
+
                             day=1
                         )
 
-
-                        # =================================================
+                        # --------------------------------------------
                         # FUTURE MONTHS
-                        # =================================================
+                        # --------------------------------------------
 
                         selected_months = []
 
                         for i in range(
+
                             1,
+
                             prediction_count + 1
                         ):
 
                             future_date = (
+
                                 last_date
-                                + pd.DateOffset(
+
+                                +
+                                pd.DateOffset(
                                     months=i
                                 )
                             )
@@ -2155,26 +2864,27 @@ def upload_data():
                                 future_date
                             )
 
-
                         print(
-                            "\nPrediction months:"
+                            "\nPrediction months:",
+                            flush=True
                         )
 
                         for date in selected_months:
 
                             print(
+
                                 date.strftime(
                                     "%B %Y"
-                                )
+                                ),
+
+                                flush=True
                             )
 
-
-                        # =================================================
+                        # --------------------------------------------
                         # PROCESS STUDENTS
-                        # =================================================
+                        # --------------------------------------------
 
                         students_found = []
-
 
                         for _, row in uploaded.iterrows():
 
@@ -2182,13 +2892,11 @@ def upload_data():
                                 row["Student_ID"]
                             ).strip()
 
-
-                            # ---------------------------------------------
-                            # ATTENDANCE HISTORY
-                            # ---------------------------------------------
-
                             history_rows = []
 
+                            # ----------------------------------------
+                            # ATTENDANCE HISTORY
+                            # ----------------------------------------
 
                             for month_number in month_numbers:
 
@@ -2202,10 +2910,9 @@ def upload_data():
                                     column_name
                                 ]
 
-
                                 if pd.isna(value):
-                                    continue
 
+                                    continue
 
                                 try:
 
@@ -2213,24 +2920,30 @@ def upload_data():
                                         value
                                     )
 
-                                except:
+                                except (
+                                    ValueError,
+                                    TypeError
+                                ):
 
                                     continue
-
 
                                 if (
                                     value < 0
-                                    or value > 100
+                                    or
+                                    value > 100
                                 ):
-                                    continue
 
+                                    continue
 
                                 history_rows.append({
 
                                     "ds":
                                         pd.Timestamp(
+
                                             year=2026,
+
                                             month=month_number,
+
                                             day=1
                                         ),
 
@@ -2238,54 +2951,56 @@ def upload_data():
                                         value
                                 })
 
-
-                            # ---------------------------------------------
+                            # ----------------------------------------
                             # MINIMUM TWO MONTHS
-                            # ---------------------------------------------
+                            # ----------------------------------------
 
                             if len(history_rows) < 2:
 
                                 print(
+
                                     f"Skipping {student_id}: "
-                                    f"less than two valid months"
+                                    f"less than two valid months",
+
+                                    flush=True
                                 )
 
                                 continue
-
 
                             history = pd.DataFrame(
                                 history_rows
                             )
 
-
                             history = (
+
                                 history
-                                .sort_values("ds")
+                                .sort_values(
+                                    "ds"
+                                )
                                 .drop_duplicates(
                                     subset=["ds"],
                                     keep="last"
                                 )
                             )
 
-
-                            # ---------------------------------------------
+                            # ----------------------------------------
                             # CURRENT ATTENDANCE
-                            # ---------------------------------------------
+                            # ----------------------------------------
 
                             current_attendance = round(
+
                                 float(
                                     history.iloc[-1]["y"]
                                 ),
+
                                 2
                             )
 
-
-                            # ---------------------------------------------
-                            # CREATE PROPHET MODEL
-                            # ---------------------------------------------
-
                             prediction_values = []
 
+                            # ----------------------------------------
+                            # CREATE PROPHET MODEL
+                            # ----------------------------------------
 
                             try:
 
@@ -2298,67 +3013,86 @@ def upload_data():
                                     daily_seasonality=False
                                 )
 
-
                                 model.fit(
                                     history
                                 )
 
+                                # ------------------------------------
+                                # FORECAST ALL REQUIRED MONTHS
+                                # ------------------------------------
 
-                                # -----------------------------------------
-                                # NUMBER OF MONTHS
-                                # -----------------------------------------
+                                last_history_date = (
+                                    history.iloc[-1]["ds"]
+                                )
 
                                 months_ahead = (
+
                                     (
                                         selected_months[-1].year
-                                        - history.iloc[-1]["ds"].year
+                                        -
+                                        last_history_date.year
                                     )
-                                    * 12
+                                    *
+                                    12
                                     +
                                     (
                                         selected_months[-1].month
-                                        - history.iloc[-1]["ds"].month
+                                        -
+                                        last_history_date.month
                                     )
                                 )
 
+                                if months_ahead <= 0:
 
-                                # -----------------------------------------
-                                # FUTURE DATA
-                                # -----------------------------------------
+                                    months_ahead = 1
 
                                 future = (
+
                                     model
                                     .make_future_dataframe(
+
                                         periods=months_ahead,
+
                                         freq="MS"
                                     )
                                 )
-
-
-                                # -----------------------------------------
-                                # FORECAST
-                                # -----------------------------------------
 
                                 forecast = model.predict(
                                     future
                                 )
 
+                                forecast["ds"] = (
+                                    pd.to_datetime(
+                                        forecast["ds"]
+                                    )
+                                )
 
-                                # -----------------------------------------
-                                # GET EACH REQUIRED MONTH
-                                # -----------------------------------------
+                                # ------------------------------------
+                                # GET EACH MONTH
+                                # ------------------------------------
 
                                 for future_date in selected_months:
 
                                     target = forecast[
+
                                         forecast["ds"]
-                                        .dt.to_period("M")
+                                        .dt
+                                        .to_period("M")
                                         ==
                                         future_date.to_period("M")
                                     ]
 
-
                                     if target.empty:
+
+                                        print(
+
+                                            f"No forecast row "
+                                            f"for {student_id} "
+                                            f"and "
+                                            f"{future_date}",
+
+                                            flush=True
+                                        )
 
                                         prediction_values.append(
                                             None
@@ -2367,49 +3101,75 @@ def upload_data():
                                     else:
 
                                         prediction = float(
-                                            target.iloc[-1]["yhat"]
+
+                                            target.iloc[-1][
+                                                "yhat"
+                                            ]
                                         )
 
+                                        if pd.isna(
+                                            prediction
+                                        ):
 
-                                        prediction = max(
-                                            0,
-                                            min(
-                                                100,
+                                            prediction_values.append(
+                                                None
+                                            )
+
+                                        else:
+
+                                            prediction = max(
+
+                                                0,
+
+                                                min(
+                                                    100,
+                                                    prediction
+                                                )
+                                            )
+
+                                            prediction = round(
+
+                                                prediction,
+
+                                                2
+                                            )
+
+                                            prediction_values.append(
                                                 prediction
                                             )
-                                        )
 
+                                print(
 
-                                        prediction = round(
-                                            prediction,
-                                            2
-                                        )
+                                    f"Prediction successful "
+                                    f"for {student_id}: "
+                                    f"{prediction_values}",
 
-
-                                        prediction_values.append(
-                                            prediction
-                                        )
-
+                                    flush=True
+                                )
 
                             except Exception as e:
 
                                 print(
+
                                     f"Prediction error "
                                     f"for {student_id}: "
-                                    f"{e}"
+                                    f"{repr(e)}",
+
+                                    flush=True
                                 )
 
+                                traceback.print_exc()
 
                                 prediction_values = [
+
                                     None
-                                    for _
-                                    in selected_months
+
+                                    for _ in selected_months
                                 ]
 
-
-                            # ---------------------------------------------
+                            # ----------------------------------------
                             # STUDENT RESULT
-                            # ---------------------------------------------
+                            # ----------------------------------------
 
                             student_result = {
 
@@ -2441,10 +3201,9 @@ def upload_data():
                                     current_attendance
                             }
 
-
-                            # ---------------------------------------------
+                            # ----------------------------------------
                             # ADD PREDICTIONS
-                            # ---------------------------------------------
+                            # ----------------------------------------
 
                             for index, future_date in enumerate(
                                 selected_months
@@ -2456,35 +3215,32 @@ def upload_data():
                                     )
                                 )
 
-
                                 student_result[
                                     "Prediction_"
-                                    + month_key
+                                    +
+                                    month_key
                                 ] = (
+
                                     prediction_values[
                                         index
                                     ]
                                 )
 
-
                             students_found.append(
                                 student_result
                             )
 
-
-                        # =================================================
+                        # --------------------------------------------
                         # FINAL RESULT
-                        # =================================================
+                        # --------------------------------------------
 
                         result = students_found
 
-
-                        # =================================================
-                        # CREATE DOWNLOAD FILE
-                        # =================================================
+                        # --------------------------------------------
+                        # DOWNLOAD FILE
+                        # --------------------------------------------
 
                         download_rows = []
-
 
                         for student in result:
 
@@ -2531,7 +3287,6 @@ def upload_data():
                                     ]
                             }
 
-
                             for future_date in selected_months:
 
                                 month_key = (
@@ -2540,68 +3295,75 @@ def upload_data():
                                     )
                                 )
 
-
                                 download_row[
                                     future_date.strftime(
                                         "%B %Y"
                                     )
                                 ] = student.get(
-                                    "Prediction_"
-                                    + month_key
-                                )
 
+                                    "Prediction_"
+                                    +
+                                    month_key
+                                )
 
                             download_rows.append(
                                 download_row
                             )
 
-
                         prediction_dataframe = pd.DataFrame(
                             download_rows
                         )
 
-
                         download_file = os.path.join(
+
                             app.config[
                                 "UPLOAD_FOLDER"
                             ],
+
                             "predicted_attendance.xlsx"
                         )
 
-
                         prediction_dataframe.to_excel(
+
                             download_file,
+
                             index=False
                         )
 
-
                         print(
-                            "\nPrediction completed."
+                            "\nPrediction completed.",
+                            flush=True
                         )
 
                         print(
                             "Students predicted:",
-                            len(result)
+                            len(result),
+                            flush=True
                         )
 
                         print(
                             "File saved:",
-                            download_file
+                            download_file,
+                            flush=True
                         )
-
 
             except Exception as e:
 
                 print(
                     "UPLOAD ERROR:",
-                    e
+                    repr(e),
+                    flush=True
                 )
+
+                traceback.print_exc()
 
                 error = (
-                    "Error while processing Excel: "
-                    + str(e)
-                )
 
+                    "Error while processing Excel: "
+
+                    +
+                    str(e)
+                )
 
     return render_template(
 
@@ -2625,20 +3387,27 @@ def upload_data():
 def download_predictions():
 
     if "faculty" not in session:
-        return redirect(url_for("login"))
+
+        return redirect(
+            url_for("login")
+        )
 
     download_file = os.path.join(
-        app.config["UPLOAD_FOLDER"],
+
+        app.config[
+            "UPLOAD_FOLDER"
+        ],
+
         "predicted_attendance.xlsx"
     )
 
-    if not os.path.exists(download_file):
+    if not os.path.exists(
+        download_file
+    ):
 
         return redirect(
             url_for("upload_data")
         )
-
-    from flask import send_file
 
     return send_file(
 
@@ -2646,20 +3415,26 @@ def download_predictions():
 
         as_attachment=True,
 
-        download_name="predicted_attendance.xlsx"
+        download_name=
+            "predicted_attendance.xlsx"
     )
+
 
 # ============================================================
 # ADD NEW STUDENT
 # ============================================================
 
-
-
-@app.route("/add-student", methods=["GET", "POST"])
+@app.route(
+    "/add-student",
+    methods=["GET", "POST"]
+)
 def add_student():
 
     if "faculty" not in session:
-        return redirect(url_for("login"))
+
+        return redirect(
+            url_for("login")
+        )
 
     if request.method == "GET":
 
@@ -2667,11 +3442,9 @@ def add_student():
             "add_student.html"
         )
 
-    # Your existing add-student processing code goes here
-
-    # ========================================================
+    # --------------------------------------------------------
     # STUDENT DETAILS
-    # ========================================================
+    # --------------------------------------------------------
 
     student = {
 
@@ -2724,29 +3497,36 @@ def add_student():
             ).strip()
     }
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # ATTENDANCE
-    # ========================================================
+    # --------------------------------------------------------
 
     month_fields = {
 
         "2026-01-01": "jan",
+
         "2026-02-01": "feb",
+
         "2026-03-01": "mar",
+
         "2026-04-01": "apr",
+
         "2026-05-01": "may",
+
         "2026-06-01": "jun",
+
         "2026-07-01": "jul",
+
         "2026-08-01": "aug",
+
         "2026-09-01": "sep",
+
         "2026-10-01": "oct",
+
         "2026-11-01": "nov"
     }
 
-
     attendance = {}
-
 
     for month, field in month_fields.items():
 
@@ -2755,155 +3535,191 @@ def add_student():
             ""
         ).strip()
 
-
         if value != "":
 
             try:
 
-                value = float(value)
+                value = float(
+                    value
+                )
 
             except ValueError:
 
                 return render_template(
-                    "add_student.html",
-                    error=f"Invalid attendance value for {field.upper()}."
-                )
 
+                    "add_student.html",
+
+                    error=(
+                        "Invalid attendance "
+                        f"value for {field.upper()}."
+                    )
+                )
 
             if value < 0 or value > 100:
 
                 return render_template(
+
                     "add_student.html",
-                    error=f"Attendance for {field.upper()} must be between 0 and 100."
+
+                    error=(
+                        f"Attendance for "
+                        f"{field.upper()} must "
+                        f"be between 0 and 100."
+                    )
                 )
 
+            attendance[
+                month
+            ] = value
 
-            attendance[month] = value
-
-
-    # ========================================================
-    # CHECK MINIMUM DATA
-    # ========================================================
+    # --------------------------------------------------------
+    # MINIMUM DATA
+    # --------------------------------------------------------
 
     if len(attendance) < 2:
 
         return render_template(
+
             "add_student.html",
-            error="Please enter attendance for at least two months."
+
+            error=(
+                "Please enter attendance "
+                "for at least two months."
+            )
         )
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # PREDICTION MONTH
-    # ========================================================
+    # --------------------------------------------------------
 
     prediction_month = request.form.get(
         "prediction_month",
         ""
     ).strip()
 
-
     if not prediction_month:
 
         return render_template(
+
             "add_student.html",
-            error="Please select a prediction month."
+
+            error=(
+                "Please select a prediction month."
+            )
         )
 
-
-    # ========================================================
-    # CREATE MODEL
-    # ========================================================
+    # --------------------------------------------------------
+    # CREATE MODEL AND PREDICT
+    # --------------------------------------------------------
 
     try:
 
-        model, history = create_student_model(
-            attendance
+        model, history = (
+            create_student_model(
+                attendance
+            )
         )
 
+        prediction_value = (
+            predict_month(
 
-        prediction_value = predict_month(
-            model,
-            history,
-            prediction_month
+                model,
+
+                history,
+
+                prediction_month
+            )
         )
-
 
     except Exception as e:
 
+        print(
+            "New student prediction error:",
+            repr(e),
+            flush=True
+        )
+
+        traceback.print_exc()
+
         return render_template(
+
             "add_student.html",
+
             error=str(e)
         )
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # CURRENT ATTENDANCE
-    # ========================================================
+    # --------------------------------------------------------
 
     latest_attendance = float(
+
         history.iloc[-1]["y"]
     )
 
     latest_attendance = round(
+
         latest_attendance,
+
         2
     )
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # PREDICTION INFORMATION
-    # ========================================================
+    # --------------------------------------------------------
 
     prediction_date = pd.to_datetime(
         prediction_month
     )
 
-
-    predicted_month = prediction_date.strftime(
-        "%B %Y"
+    predicted_month = (
+        prediction_date.strftime(
+            "%B %Y"
+        )
     )
 
-
-    attendance_level = get_attendance_level(
-        prediction_value
+    attendance_level = (
+        get_attendance_level(
+            prediction_value
+        )
     )
-
 
     status = get_status(
         prediction_value
     )
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # GRAPH DATA
-    # ========================================================
+    # --------------------------------------------------------
 
     chart_labels = [
+
         date.strftime("%B")
+
         for date in history["ds"]
     ]
 
-
     chart_values = [
-        round(float(value), 2)
+
+        round(
+            float(value),
+            2
+        )
+
         for value in history["y"]
     ]
-
 
     chart_labels.append(
         predicted_month
     )
 
-
     chart_values.append(
         prediction_value
     )
 
-
-    # ========================================================
-    # SHOW RESULT
-    # ========================================================
+    # --------------------------------------------------------
+    # RESULT
+    # --------------------------------------------------------
 
     return render_template(
 
@@ -2911,21 +3727,27 @@ def add_student():
 
         student=student,
 
-        current_attendance=latest_attendance,
+        current_attendance=
+            latest_attendance,
 
-        predicted_value=prediction_value,
+        predicted_value=
+            prediction_value,
 
-        predicted_month=predicted_month,
+        predicted_month=
+            predicted_month,
 
-        attendance_level=attendance_level,
+        attendance_level=
+            attendance_level,
 
-        status=status,
+        status=
+            status,
 
-        chart_labels=chart_labels,
+        chart_labels=
+            chart_labels,
 
-        chart_values=chart_values
+        chart_values=
+            chart_values
     )
-
 
 
 # ============================================================
